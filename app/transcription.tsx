@@ -173,9 +173,24 @@ export default function Transcription() {
   // Save a buffered chunk, transcribe it via whisper.rn, hand result to the
   // normal handleNewTranscription path. Inflight guard avoids overlapping jobs.
   const transcribeBtChunk = async (chunk: Float32Array) => {
-    if (!whisperContextRef.current) return;
+    if (!whisperContextRef.current) { console.log('[BT-WHISPER] no whisper context'); return; }
     if (btTranscribingRef.current) return;
     btTranscribingRef.current = true;
+
+    // --- DIAGNOSTIC: measure the float chunk handed to whisper ---
+    let sumSq = 0, peak = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const v = chunk[i];
+      sumSq += v * v;
+      const a = v < 0 ? -v : v;
+      if (a > peak) peak = a;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, chunk.length));
+    console.log(
+      `[BT-WHISPER] transcribing ${chunk.length} samples ` +
+      `(${(chunk.length / BT_SAMPLE_RATE).toFixed(1)}s) rms=${rms.toFixed(4)} peak=${peak.toFixed(3)}`
+    );
+
     let path: string | null = null;
     try {
       const FS = FileSystem;
@@ -192,9 +207,10 @@ export default function Transcription() {
       });
       const result = await (job?.promise ?? job);
       const text = (result?.result ?? '').toString().trim();
+      console.log(`[BT-WHISPER] result="${text}"`);
       if (text) handleNewTranscription(text);
     } catch (e) {
-      console.warn('BT chunk transcribe error:', e);
+      console.warn('[BT-WHISPER] transcribe error:', e);
     } finally {
       btTranscribingRef.current = false;
       if (path) {
@@ -328,6 +344,10 @@ export default function Transcription() {
       }
     } else {
       const useBtAudio = !!audioDevice;
+      console.log(
+        `[REC] start: isRemote=${isRemote} useBtAudio=${useBtAudio} ` +
+        `hasWhisper=${!!whisperContextRef.current} hasRealtime=${!!RealtimeTranscriber} modelPath=${!!modelPath}`
+      );
       if (!useBtAudio) {
         const hasPermission = await requestMicrophonePermission();
         if (!hasPermission) return;
@@ -427,6 +447,11 @@ export default function Transcription() {
            });
            btFlushTimerRef.current = setInterval(() => {
              const minSamples = BT_SAMPLE_RATE * LOCAL_CHUNK_SEC;
+             // --- DIAGNOSTIC: buffer fill state each flush tick ---
+             console.log(
+               `[BT-FLUSH] buffer=${btBufferRef.current.length}/${minSamples} ` +
+               `transcribing=${btTranscribingRef.current}`
+             );
              if (btBufferRef.current.length < minSamples) return;
              if (btTranscribingRef.current) return;
              const chunk = btBufferRef.current;
