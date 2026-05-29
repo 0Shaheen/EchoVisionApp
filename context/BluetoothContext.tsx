@@ -20,8 +20,9 @@ const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
 const CHARACTERISTIC_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
 
 // Classic BT (RFCOMM) — used to receive PCM16 audio from the glasses.
-// The Pi sends a 44-byte WAV header once, then continuous 16 kHz mono PCM16.
-const AUDIO_WAV_HEADER_BYTES = 44;
+// The Pi sends newline-delimited base64 frames: each event from the
+// delimiter-based reader is one base64-encoded PCM16 chunk. base64 is
+// 7-bit ASCII (never contains 0x0A) so the newline framing is binary-safe.
 
 export type AudioDataCallback = (pcm: Int16Array) => void;
 
@@ -63,11 +64,6 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [audioDevice, setAudioDevice] = useState<ClassicDevice | null>(null);
   const [isAudioStreaming, setIsAudioStreaming] = useState(false);
 
-  // The Pi writes one 44-byte WAV header then raw PCM16. Track how many header
-  // bytes remain to skip across chunk boundaries, plus any trailing odd byte
-  // we have to defer to the next chunk to keep int16 alignment.
-  const headerRemainingRef = useRef(AUDIO_WAV_HEADER_BYTES);
-  const oddByteRef = useRef<number | null>(null);
   const audioSubscribersRef = useRef<Set<AudioDataCallback>>(new Set());
   const dataSubscriptionRef = useRef<BluetoothEventSubscription | null>(null);
   const disconnectSubscriptionRef = useRef<BluetoothEventSubscription | null>(null);
@@ -195,11 +191,6 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, []);
 
-  const resetAudioStreamState = () => {
-    headerRemainingRef.current = AUDIO_WAV_HEADER_BYTES;
-    oddByteRef.current = null;
-  };
-
   const stopAudioDiag = () => {
     if (audioDiagTimerRef.current) {
       clearInterval(audioDiagTimerRef.current);
@@ -207,42 +198,34 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   };
 
-  // Convert an incoming chunk of ISO-8859-1-decoded bytes into PCM16 samples
-  // and fan them out to subscribers. Handles header skipping and the case
-  // where the chunk length is odd (one byte gets carried to the next call).
-  const handleIncomingBytes = (raw: Buffer) => {
-    let offset = 0;
+  // Decode one newline-delimited base64 frame (the library already stripped
+  // the trailing "\n") into PCM16 samples and fan them out to subscribers.
+  // Each frame is a complete chunk, so there is no cross-frame byte carry.
+  const handleAudioFrame = (b64: string) => {
+    const trimmed = b64.trim();
+    if (trimmed.length === 0) return;
 
-    if (headerRemainingRef.current > 0) {
-      const skip = Math.min(headerRemainingRef.current, raw.length);
-      headerRemainingRef.current -= skip;
-      offset = skip;
-      if (offset >= raw.length) return;
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(trimmed, 'base64');
+    } catch {
+      return;
     }
+    if (bytes.length < 2) return;
 
-    let work: Buffer;
-    if (oddByteRef.current !== null) {
-      work = Buffer.concat([Buffer.from([oddByteRef.current]), raw.subarray(offset)]);
-      oddByteRef.current = null;
-    } else {
-      work = raw.subarray(offset);
-    }
-
-    if (work.length % 2 === 1) {
-      oddByteRef.current = work[work.length - 1];
-      work = work.subarray(0, work.length - 1);
-    }
-    if (work.length === 0) return;
+    // PCM16 is 2 bytes/sample; drop a stray odd byte defensively.
+    let len = bytes.length;
+    if (len % 2 === 1) len -= 1;
 
     // Copy into a fresh ArrayBuffer so Int16Array is 2-byte aligned —
     // Buffer slices may not be.
-    const aligned = new ArrayBuffer(work.length);
-    new Uint8Array(aligned).set(work);
+    const aligned = new ArrayBuffer(len);
+    new Uint8Array(aligned).set(bytes.subarray(0, len));
     const pcm16 = new Int16Array(aligned);
 
     // --- DIAGNOSTIC: accumulate stats (logged once/sec by the diag timer) ---
     const d = audioDiagRef.current;
-    d.rawBytes += raw.length;
+    d.rawBytes += bytes.length;
     d.samples += pcm16.length;
     for (let i = 0; i < pcm16.length; i++) {
       const v = pcm16[i];
@@ -262,10 +245,9 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const connectAudioDevice = useCallback(async (device: ClassicDevice) => {
     try {
-      resetAudioStreamState();
-
-      // ISO-8859-1 maps every byte 1:1 to a JS code point, so binary data
-      // survives the plugin's string decoding intact.
+      // DELIMITER "\n" makes the reader emit one base64 frame per event;
+      // ISO-8859-1 maps every byte 1:1 to a JS code point so the base64
+      // ASCII survives the plugin's string decoding intact.
       const connected = await device.connect({
         DELIMITER: '\n',
         DEVICE_CHARSET: 'ISO-8859-1',
@@ -280,15 +262,12 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         const data = evt?.data as unknown as string | undefined;
         audioDiagRef.current.events += 1;
         if (!data || data.length === 0) return;
-        const buf = Buffer.alloc(data.length);
-        for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i) & 0xff;
-        handleIncomingBytes(buf);
+        handleAudioFrame(data);
       });
 
       disconnectSubscriptionRef.current = RNBluetoothClassic.onDeviceDisconnected(() => {
         setAudioDevice(null);
         setIsAudioStreaming(false);
-        resetAudioStreamState();
         stopAudioDiag();
         dataSubscriptionRef.current?.remove();
         dataSubscriptionRef.current = null;
@@ -303,7 +282,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         console.log(
           `[BT-AUDIO] events=${d.events} raw=${d.rawBytes}B/s samples=${d.samples}/s ` +
             `peak=${d.peak} rms=${rms.toFixed(0)} (norm=${(rms / 32768).toFixed(4)}) ` +
-            `subs=${audioSubscribersRef.current.size} hdrLeft=${headerRemainingRef.current}`
+            `subs=${audioSubscribersRef.current.size}`
         );
         d.rawBytes = 0;
         d.samples = 0;
@@ -340,7 +319,6 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } finally {
       setAudioDevice(null);
       setIsAudioStreaming(false);
-      resetAudioStreamState();
     }
   }, [audioDevice]);
 
