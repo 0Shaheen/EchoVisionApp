@@ -72,6 +72,10 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const dataSubscriptionRef = useRef<BluetoothEventSubscription | null>(null);
   const disconnectSubscriptionRef = useRef<BluetoothEventSubscription | null>(null);
 
+  // --- DIAGNOSTIC: aggregate ~1s of inbound-stream stats ---
+  const audioDiagRef = useRef({ rawBytes: 0, samples: 0, sumSq: 0, peak: 0, events: 0 });
+  const audioDiagTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const requestPermissions = async () => {
     if (Platform.OS === 'android') {
       const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
@@ -196,6 +200,13 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     oddByteRef.current = null;
   };
 
+  const stopAudioDiag = () => {
+    if (audioDiagTimerRef.current) {
+      clearInterval(audioDiagTimerRef.current);
+      audioDiagTimerRef.current = null;
+    }
+  };
+
   // Convert an incoming chunk of ISO-8859-1-decoded bytes into PCM16 samples
   // and fan them out to subscribers. Handles header skipping and the case
   // where the chunk length is odd (one byte gets carried to the next call).
@@ -229,6 +240,17 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     new Uint8Array(aligned).set(work);
     const pcm16 = new Int16Array(aligned);
 
+    // --- DIAGNOSTIC: accumulate stats (logged once/sec by the diag timer) ---
+    const d = audioDiagRef.current;
+    d.rawBytes += raw.length;
+    d.samples += pcm16.length;
+    for (let i = 0; i < pcm16.length; i++) {
+      const v = pcm16[i];
+      d.sumSq += v * v;
+      const a = v < 0 ? -v : v;
+      if (a > d.peak) d.peak = a;
+    }
+
     audioSubscribersRef.current.forEach((cb) => {
       try {
         cb(pcm16);
@@ -256,6 +278,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       dataSubscriptionRef.current = device.onDataReceived((evt) => {
         const data = evt?.data as unknown as string | undefined;
+        audioDiagRef.current.events += 1;
         if (!data || data.length === 0) return;
         const buf = Buffer.alloc(data.length);
         for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i) & 0xff;
@@ -266,9 +289,28 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setAudioDevice(null);
         setIsAudioStreaming(false);
         resetAudioStreamState();
+        stopAudioDiag();
         dataSubscriptionRef.current?.remove();
         dataSubscriptionRef.current = null;
       });
+
+      // --- DIAGNOSTIC: log inbound-stream stats once per second ---
+      stopAudioDiag();
+      audioDiagRef.current = { rawBytes: 0, samples: 0, sumSq: 0, peak: 0, events: 0 };
+      audioDiagTimerRef.current = setInterval(() => {
+        const d = audioDiagRef.current;
+        const rms = d.samples ? Math.sqrt(d.sumSq / d.samples) : 0;
+        console.log(
+          `[BT-AUDIO] events=${d.events} raw=${d.rawBytes}B/s samples=${d.samples}/s ` +
+            `peak=${d.peak} rms=${rms.toFixed(0)} (norm=${(rms / 32768).toFixed(4)}) ` +
+            `subs=${audioSubscribersRef.current.size} hdrLeft=${headerRemainingRef.current}`
+        );
+        d.rawBytes = 0;
+        d.samples = 0;
+        d.sumSq = 0;
+        d.peak = 0;
+        d.events = 0;
+      }, 1000);
 
       setAudioDevice(device);
       setIsAudioStreaming(true);
@@ -283,6 +325,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const disconnectAudio = useCallback(async () => {
     try {
+      stopAudioDiag();
       dataSubscriptionRef.current?.remove();
       disconnectSubscriptionRef.current?.remove();
       dataSubscriptionRef.current = null;
@@ -310,6 +353,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   useEffect(
     () => () => {
+      stopAudioDiag();
       dataSubscriptionRef.current?.remove();
       disconnectSubscriptionRef.current?.remove();
     },
