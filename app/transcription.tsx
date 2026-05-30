@@ -45,6 +45,9 @@ console.warn = (...args) => {
   originalWarn(...args);
 };
 
+// Live BT-audio level meter (equalizer) configuration.
+const METER_BARS = 16;
+
 // --- MAIN COMPONENT ---
 
 export default function Transcription() {
@@ -83,6 +86,10 @@ export default function Transcription() {
   const LOCAL_CHUNK_SEC = 3;
   const BT_SAMPLE_RATE = 16000;
 
+  // Live audio-level meter state (driven by the incoming BT PCM stream).
+  const btMeterLevelRef = useRef(0);
+  const [meterBars, setMeterBars] = useState<number[]>(() => new Array(METER_BARS).fill(0));
+
   useEffect(() => {
     setupApp();
     return () => {
@@ -103,6 +110,39 @@ export default function Transcription() {
     currentTextRef.current = currentText;
     scrollViewRef.current?.scrollToEnd({ animated: true });
   }, [messages, currentText]);
+
+  // ── Live BT audio equalizer ────────────────────────────────────────────────
+  // Active whenever the glasses are connected — independent of recording — so
+  // it visually confirms the audio stream is arriving and how loud it is.
+  // Each incoming PCM chunk updates a peak level; a timer shifts that level
+  // into a scrolling bar history and decays it so the bars fall when quiet.
+  useEffect(() => {
+    if (!audioDevice) {
+      setMeterBars(new Array(METER_BARS).fill(0));
+      return;
+    }
+    btMeterLevelRef.current = 0;
+    const unsub = onAudioData((pcm) => {
+      let sumSq = 0;
+      for (let i = 0; i < pcm.length; i++) { const v = pcm[i]; sumSq += v * v; }
+      const rms = pcm.length ? Math.sqrt(sumSq / pcm.length) : 0;
+      const norm = rms / 32768;                          // 0..1
+      const lvl = Math.min(1, Math.sqrt(norm) * 3.2);    // perceptual-ish scaling
+      if (lvl > btMeterLevelRef.current) btMeterLevelRef.current = lvl;  // fast attack
+    });
+    const timer = setInterval(() => {
+      setMeterBars((prev) => {
+        const next = prev.slice(1);
+        next.push(btMeterLevelRef.current);
+        btMeterLevelRef.current *= 0.6;                  // decay toward 0 when quiet
+        return next;
+      });
+    }, 70) as unknown as number;
+    return () => {
+      unsub();
+      clearInterval(timer);
+    };
+  }, [audioDevice, onAudioData]);
 
   const speakText = (text: string) => {
     Speech.stop(); 
@@ -516,6 +556,30 @@ export default function Transcription() {
         </View>
       </View>
 
+      {audioDevice && (
+        <View style={styles.meterContainer}>
+          <Text style={styles.meterLabel}>BT AUDIO</Text>
+          <View style={styles.meterBars}>
+            {meterBars.map((v, i) => {
+              const active = v > 0.04;
+              return (
+                <View
+                  key={i}
+                  style={[
+                    styles.meterBar,
+                    {
+                      height: 4 + Math.round(v * 26),
+                      backgroundColor: active ? '#FF9500' : '#E5E5E5',
+                      opacity: active ? 0.45 + 0.55 * Math.min(1, v) : 1,
+                    },
+                  ]}
+                />
+              );
+            })}
+          </View>
+        </View>
+      )}
+
       <View style={styles.contentFrame}>
         {!modelReady && (
           <View style={styles.loaderContainer}>
@@ -593,6 +657,10 @@ const styles = StyleSheet.create({
   statusBadge: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, gap: 6 },
   statusDot: { width: 6, height: 6, borderRadius: 3 },
   statusBadgeText: { fontSize: 11, fontWeight: '800', textTransform: 'uppercase' },
+  meterContainer: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 24, marginBottom: 16, gap: 12 },
+  meterLabel: { fontSize: 10, fontWeight: '800', color: '#FF9500', letterSpacing: 0.5, width: 56 },
+  meterBars: { flex: 1, flexDirection: 'row', alignItems: 'flex-end', height: 32, gap: 3 },
+  meterBar: { flex: 1, borderRadius: 2, minHeight: 4 },
   contentFrame: { flex: 1, width: "100%", backgroundColor: '#FFFFFF', borderTopLeftRadius: 32, borderTopRightRadius: 32, borderWidth: 1, borderColor: '#E5E5E5', overflow: 'hidden' },
   loaderContainer: { padding: 20, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 12, borderBottomWidth: 1, borderBottomColor: '#F2F2F7' },
   statusText: { color: "#8E8E93", fontSize: 14, fontWeight: '600' },
