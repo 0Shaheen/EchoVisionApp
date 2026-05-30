@@ -83,7 +83,7 @@ export default function Transcription() {
   const btFlushTimerRef = useRef<number | null>(null);
   const btBufferRef = useRef<Float32Array>(new Float32Array(0));
   const btTranscribingRef = useRef(false);
-  const LOCAL_CHUNK_SEC = 3;
+  const LOCAL_CHUNK_SEC = 2;
   const BT_SAMPLE_RATE = 16000;
 
   // Live audio-level meter state (driven by the incoming BT PCM stream).
@@ -212,12 +212,16 @@ export default function Transcription() {
 
   // Save a buffered chunk, transcribe it via whisper.rn, hand result to the
   // normal handleNewTranscription path. Inflight guard avoids overlapping jobs.
+  //
+  // The BT mic audio is far-field and quiet (~ -40 dBFS), so we auto-gain each
+  // chunk up to a healthy level before Whisper sees it.  Near-silent chunks are
+  // skipped so the noise floor isn't amplified into hallucinated words.
   const transcribeBtChunk = async (chunk: Float32Array) => {
-    if (!whisperContextRef.current) { console.log('[BT-WHISPER] no whisper context'); return; }
-    if (btTranscribingRef.current) return;
+    console.log(`[BT-WHISPER] enter: samples=${chunk.length} hasCtx=${!!whisperContextRef.current} busy=${btTranscribingRef.current}`);
+    if (!whisperContextRef.current) { console.log('[BT-WHISPER] abort: no whisper context'); return; }
+    if (btTranscribingRef.current) { console.log('[BT-WHISPER] abort: previous job still running'); return; }
     btTranscribingRef.current = true;
 
-    // --- DIAGNOSTIC: measure the float chunk handed to whisper ---
     let sumSq = 0, peak = 0;
     for (let i = 0; i < chunk.length; i++) {
       const v = chunk[i];
@@ -226,22 +230,42 @@ export default function Transcription() {
       if (a > peak) peak = a;
     }
     const rms = Math.sqrt(sumSq / Math.max(1, chunk.length));
-    console.log(
-      `[BT-WHISPER] transcribing ${chunk.length} samples ` +
-      `(${(chunk.length / BT_SAMPLE_RATE).toFixed(1)}s) rms=${rms.toFixed(4)} peak=${peak.toFixed(3)}`
-    );
 
     let path: string | null = null;
     try {
+      // Skip chunks that are essentially silence (only a noise floor).
+      if (peak < 0.005) {
+        console.log(`[BT-WHISPER] skip near-silent chunk (peak=${peak.toFixed(4)} rms=${rms.toFixed(4)})`);
+        return;
+      }
+
+      // Auto-gain: bring the loudest sample up to ~0.6, capped at 20x so a
+      // quiet noise floor can never be blown up to full scale.
+      const gain = Math.min(20, 0.6 / peak);
+      const boosted = new Float32Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        let s = chunk[i] * gain;
+        if (s > 1) s = 1; else if (s < -1) s = -1;
+        boosted[i] = s;
+      }
+
+      console.log(
+        `[BT-WHISPER] transcribing ${chunk.length} samples ` +
+        `(${(chunk.length / BT_SAMPLE_RATE).toFixed(1)}s) rms=${rms.toFixed(4)} ` +
+        `peak=${peak.toFixed(4)} gain=${gain.toFixed(1)}x`
+      );
+
       const FS = FileSystem;
       const dir = FS.cacheDirectory ?? FS.documentDirectory;
-      if (!dir) return;
+      if (!dir) { console.log('[BT-WHISPER] abort: no cache/document directory'); return; }
       path = `${dir}bt-chunk-${Date.now()}.wav`;
-      const wav = encodeWavPcm16(chunk, BT_SAMPLE_RATE);
+      const wav = encodeWavPcm16(boosted, BT_SAMPLE_RATE);
       await FS.writeAsStringAsync(path, wav.toString('base64'), {
         encoding: FS.EncodingType.Base64,
       });
-      const job: any = (whisperContextRef.current as any).transcribe(path, {
+      // whisper.rn (Android) wants a plain filesystem path, not a file:// URI.
+      const fsPath = path.replace(/^file:\/\//, '');
+      const job: any = (whisperContextRef.current as any).transcribe(fsPath, {
         language: selectedLanguage,
         beamSize: 1,
       });
@@ -487,15 +511,14 @@ export default function Transcription() {
            });
            btFlushTimerRef.current = setInterval(() => {
              const minSamples = BT_SAMPLE_RATE * LOCAL_CHUNK_SEC;
+             const have = btBufferRef.current.length;
              // --- DIAGNOSTIC: buffer fill state each flush tick ---
-             console.log(
-               `[BT-FLUSH] buffer=${btBufferRef.current.length}/${minSamples} ` +
-               `transcribing=${btTranscribingRef.current}`
-             );
-             if (btBufferRef.current.length < minSamples) return;
+             console.log(`[BT-FLUSH] buffer=${have}/${minSamples} transcribing=${btTranscribingRef.current}`);
+             if (have < minSamples) return;
              if (btTranscribingRef.current) return;
              const chunk = btBufferRef.current;
              btBufferRef.current = new Float32Array(0);
+             console.log(`[BT-WHISPER] buffer full (${chunk.length} samples) → invoking transcribe`);
              void transcribeBtChunk(chunk);
            }, 500) as unknown as number;
         } else if (RealtimeTranscriber) {
